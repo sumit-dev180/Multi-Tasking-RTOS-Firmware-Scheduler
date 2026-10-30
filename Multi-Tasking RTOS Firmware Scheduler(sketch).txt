@@ -1,0 +1,239 @@
+// Multi-Tasking RTOS Firmware Scheduler (ESP32 + FreeRTOS)
+// Tasks: Sensor (prio 2), Display (prio 1), Emergency Alarm (prio 3)
+// Sync : Queue (sensor->display), Task Notification (sensor->alarm),
+//        Mutex (Serial + shared alarm flag)
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <stdarg.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <DHT.h>
+
+// ---------- Pins ----------
+#define DHT_PIN     15
+#define DHT_TYPE    DHT22
+#define LED_PIN     27
+#define BUZZER_PIN  26
+#define OLED_ADDR   0x3C
+
+// ---------- Thresholds (hysteresis) ----------
+const float TEMP_HIGH  = 40.0;   // alarm ON  >= 40 C
+const float TEMP_CLEAR = 38.0;   // alarm OFF <  38 C
+
+// ---------- Priorities ----------
+#define PRIO_DISPLAY  1
+#define PRIO_SENSOR   2
+#define PRIO_ALARM    3
+
+// ---------- Objects ----------
+DHT dht(DHT_PIN, DHT_TYPE);
+Adafruit_SSD1306 display(128, 64, &Wire, -1);
+
+struct Reading {
+  float    temp;
+  float    hum;
+  uint32_t ms;
+};
+
+QueueHandle_t     displayQueue;
+SemaphoreHandle_t serialMutex;
+SemaphoreHandle_t stateMutex;
+TaskHandle_t      alarmTaskHandle = NULL;
+
+bool gAlarmActive = false;       // shared: written by Alarm task, read by Display task
+
+// ---------- Buzzer helper (works on both ESP32 core versions) ----------
+void buzzerBegin() {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttach(BUZZER_PIN, 2000, 8);
+#else
+  ledcSetup(0, 2000, 8);
+  ledcAttachPin(BUZZER_PIN, 0);
+#endif
+}
+
+void buzzerTone(uint16_t freq) {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWriteTone(BUZZER_PIN, freq);
+#else
+  ledcWriteTone(0, freq);
+#endif
+}
+
+// ---------- Thread-safe print (Serial is a shared resource) ----------
+void safePrint(const char* fmt, ...) {
+  char buf[128];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  if (xSemaphoreTake(serialMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    Serial.println(buf);
+    xSemaphoreGive(serialMutex);
+  }
+}
+
+// =====================================================
+// TASK 1: Sensor Acquisition (periodic, every 2000 ms)
+// =====================================================
+void sensorTask(void* pv) {
+  TickType_t lastWake = xTaskGetTickCount();
+  bool alarmSent = false;
+
+  for (;;) {
+    float t = dht.readTemperature();
+    float h = dht.readHumidity();
+
+    if (isnan(t) || isnan(h)) {
+      safePrint("[%6lu ms][SENSOR ] read failed", (unsigned long)millis());
+    } else {
+      Reading r = { t, h, millis() };
+      xQueueSend(displayQueue, &r, 0);          // non-blocking send to display
+
+      safePrint("[%6lu ms][SENSOR ] T=%.1f C  H=%.1f %%",
+                (unsigned long)r.ms, t, h);
+
+      // Critical condition -> notify alarm task immediately
+      if (!alarmSent && t >= TEMP_HIGH) {
+        alarmSent = true;
+        xTaskNotify(alarmTaskHandle, 1, eSetValueWithOverwrite);
+      } else if (alarmSent && t < TEMP_CLEAR) {
+        alarmSent = false;
+        xTaskNotify(alarmTaskHandle, 0, eSetValueWithOverwrite);
+      }
+    }
+    vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(2000));   // exact periodic timing
+  }
+}
+
+// =====================================================
+// TASK 2: Display Update (periodic, every 500 ms)
+// =====================================================
+void displayTask(void* pv) {
+  TickType_t lastWake = xTaskGetTickCount();
+  Reading r = { 0, 0, 0 };
+  bool haveData = false;
+
+  for (;;) {
+    // Drain queue, keep latest reading (never blocks)
+    Reading n;
+    while (xQueueReceive(displayQueue, &n, 0) == pdTRUE) {
+      r = n;
+      haveData = true;
+    }
+
+    bool alarm;
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    alarm = gAlarmActive;
+    xSemaphoreGive(stateMutex);
+
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.print("RTOS Monitor  ");
+    display.print(millis() / 1000);
+    display.print("s");
+    display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+
+    if (haveData) {
+      display.setTextSize(2);
+      display.setCursor(0, 16);
+      display.printf("T:%.1fC", r.temp);
+      display.setCursor(0, 34);
+      display.printf("H:%.1f%%", r.hum);
+    } else {
+      display.setTextSize(1);
+      display.setCursor(0, 20);
+      display.print("Waiting for sensor...");
+    }
+
+    if (alarm) {
+      display.fillRect(0, 52, 128, 12, SSD1306_WHITE);
+      display.setTextColor(SSD1306_BLACK);
+      display.setTextSize(1);
+      display.setCursor(10, 54);
+      display.print("!! EMERGENCY !!");
+    } else {
+      display.setTextSize(1);
+      display.setCursor(0, 54);
+      display.print("Status: NORMAL");
+    }
+    display.display();
+
+    vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(500));
+  }
+}
+
+// =====================================================
+// TASK 3: Emergency Alarm (highest priority, event-driven)
+// =====================================================
+void alarmTask(void* pv) {
+  bool active = false;
+  bool on = false;
+
+  for (;;) {
+    uint32_t val = 0;
+    // Sleep forever when idle (0 CPU). Blink every 150 ms when alarm is active.
+    TickType_t wait = active ? pdMS_TO_TICKS(150) : portMAX_DELAY;
+
+    if (xTaskNotifyWait(0, 0xFFFFFFFF, &val, wait) == pdTRUE) {
+      active = (val == 1);
+
+      xSemaphoreTake(stateMutex, portMAX_DELAY);
+      gAlarmActive = active;
+      xSemaphoreGive(stateMutex);
+
+      safePrint("[%6lu ms][ALARM  ] %s", (unsigned long)millis(),
+                active ? "*** EMERGENCY ACTIVATED ***" : "alarm cleared, back to normal");
+
+      if (!active) {
+        on = false;
+        digitalWrite(LED_PIN, LOW);
+        buzzerTone(0);
+      }
+    }
+
+    if (active) {                       // blink LED + beep buzzer
+      on = !on;
+      digitalWrite(LED_PIN, on);
+      buzzerTone(on ? 2000 : 0);
+    }
+  }
+}
+
+// =====================================================
+void setup() {
+  Serial.begin(115200);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  buzzerBegin();
+  buzzerTone(0);
+  dht.begin();
+
+  Wire.begin(21, 22);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("OLED init failed");
+    while (true) delay(1000);
+  }
+  display.clearDisplay();
+  display.display();
+
+  // RTOS objects
+  displayQueue = xQueueCreate(4, sizeof(Reading));
+  serialMutex  = xSemaphoreCreateMutex();
+  stateMutex   = xSemaphoreCreateMutex();
+
+  Serial.println("=== FreeRTOS Multi-Task Scheduler Started ===");
+  Serial.println("Priorities: Alarm=3  Sensor=2  Display=1");
+
+  // Alarm task is created first so its handle is valid for the sensor task
+  xTaskCreate(alarmTask,   "Alarm",   4096, NULL, PRIO_ALARM,   &alarmTaskHandle);
+  xTaskCreate(sensorTask,  "Sensor",  4096, NULL, PRIO_SENSOR,  NULL);
+  xTaskCreate(displayTask, "Display", 4096, NULL, PRIO_DISPLAY, NULL);
+}
+
+void loop() {
+  vTaskDelay(portMAX_DELAY);   // everything runs in tasks
+}
